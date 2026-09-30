@@ -84,7 +84,7 @@ pub(super) async fn index_file(
 
     if !docs_to_embed.is_empty() {
         let texts: Vec<String> = docs_to_embed.iter().map(|doc| doc.text.clone()).collect();
-        let embeddings = context.embedder.embed(&texts).await?;
+        let mut embeddings = context.embedder.embed(&texts).await?;
         if embeddings.len() != docs_to_embed.len() {
             return Err(MinSyncError::Embedding(format!(
                 "expected {} embeddings, got {}",
@@ -92,6 +92,15 @@ pub(super) async fn index_file(
                 embeddings.len()
             )));
         }
+        repair_non_finite_embeddings(
+            context.embedder,
+            &texts,
+            &mut embeddings,
+            context.config.embedder.max_retries,
+            path,
+            &docs_to_embed,
+        )
+        .await?;
 
         result.embedding_api_calls += 1;
         result.embedded_texts += texts.len();
@@ -115,6 +124,51 @@ pub(super) async fn index_file(
     result.files_processed += 1;
     result.files_processed_paths.push(path.to_string());
 
+    Ok(())
+}
+
+fn is_finite_embedding(embedding: &[f32]) -> bool {
+    embedding.iter().all(|value| value.is_finite())
+}
+
+/// Re-embed chunks whose vectors contain NaN/inf, one text per request.
+///
+/// Local GPU backends can emit non-finite values for a single chunk inside a
+/// large batch without the input itself being invalid, so re-embedding it
+/// alone usually yields a valid vector. Without this, one bad vector aborts
+/// the whole sync at upsert time. Chunks that stay non-finite after
+/// `max_retries` single-text attempts fail with the file path and chunk index
+/// so the offending file can be inspected or excluded.
+async fn repair_non_finite_embeddings(
+    embedder: &dyn Embedder,
+    texts: &[String],
+    embeddings: &mut [Vec<f32>],
+    max_retries: usize,
+    path: &str,
+    docs: &[Document],
+) -> Result<()> {
+    for index in 0..embeddings.len() {
+        if is_finite_embedding(&embeddings[index]) {
+            continue;
+        }
+        let mut attempts = 0;
+        while attempts < max_retries.max(1) && !is_finite_embedding(&embeddings[index]) {
+            attempts += 1;
+            tracing::warn!(
+                path,
+                chunk_index = index,
+                attempt = attempts,
+                "embedding contains non-finite values; re-embedding chunk alone"
+            );
+            embeddings[index] = embedder.embed_single(&texts[index]).await?;
+        }
+        if !is_finite_embedding(&embeddings[index]) {
+            return Err(MinSyncError::Embedding(format!(
+                "embedding for {path} (chunk {index}, document {}) contains non-finite values after {attempts} single-chunk retries",
+                docs[index].id
+            )));
+        }
+    }
     Ok(())
 }
 

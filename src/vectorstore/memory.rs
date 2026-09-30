@@ -13,6 +13,14 @@ impl InMemoryStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    #[cfg(test)]
+    pub fn all_embeddings(&self) -> Vec<Vec<f32>> {
+        self.docs
+            .values()
+            .map(|doc| doc.embedding.clone())
+            .collect()
+    }
 }
 
 impl VectorStore for InMemoryStore {

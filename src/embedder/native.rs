@@ -12,6 +12,18 @@ use tokio::sync::OnceCell;
 
 const DEFAULT_MAX_LENGTH: usize = 2048;
 
+/// Upper bound on the attention-score tensor (`batch x heads x seq x seq`)
+/// materialized per forward pass. On Metal, a tensor above 4 GiB makes the
+/// forward return NaN or silently wrong (finite) vectors, e.g. 17 inputs
+/// padded to 2048 tokens with Qwen3-0.6B's 16 heads is ~4.6 GiB. 1 GiB keeps
+/// a wide margin and bounds peak memory; smaller batches of long inputs cost
+/// no throughput because attention is already compute-bound there.
+const ATTENTION_BYTES_BUDGET: usize = 1 << 30;
+
+/// Qwen3 uses byte-level BPE, so a text never tokenizes to more tokens than
+/// its UTF-8 byte length. This slack covers template/special tokens.
+const SPECIAL_TOKEN_SLACK: usize = 8;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativeDevice {
     Auto,
@@ -92,12 +104,23 @@ impl NativeEmbedder {
         }
         let model = self.model().await?;
         let batch_size = self.batch_size;
+        let max_length = self.max_length;
+        let dtype_bytes = self.dtype.to_candle().size_in_bytes();
         tokio::task::spawn_blocking(move || {
             let model = model.lock().map_err(|error| {
                 MinSyncError::Embedding(format!("native model lock poisoned: {error}"))
             })?;
+            let per_row_attention_bytes = model.config().num_attention_heads.max(1) * dtype_bytes;
+            let batches = plan_batches(
+                &texts,
+                batch_size,
+                max_length,
+                per_row_attention_bytes,
+                ATTENTION_BYTES_BUDGET,
+            );
             let mut all = Vec::with_capacity(texts.len());
-            for chunk in texts.chunks(batch_size) {
+            for range in batches {
+                let chunk = &texts[range];
                 let vectors = model.embed(chunk).map_err(|error| {
                     MinSyncError::Embedding(format!("native embedding failed: {error}"))
                 })?;
@@ -147,6 +170,46 @@ impl Embedder for NativeEmbedder {
             .next()
             .ok_or_else(|| MinSyncError::Embedding("empty response".to_string()))
     }
+}
+
+/// Split `texts` into consecutive batches of at most `batch_size` inputs whose
+/// attention-score tensor stays within `budget_bytes`.
+///
+/// Inputs are left-padded to the longest member, so a batch costs
+/// `len * per_row_bytes * padded^2` where `per_row_bytes` is
+/// `heads * dtype_size` and `padded` is bounded by the byte length of the
+/// longest text (capped at `max_length`). A single input always forms a
+/// batch on its own even when it alone exceeds the budget.
+fn plan_batches(
+    texts: &[String],
+    batch_size: usize,
+    max_length: usize,
+    per_row_bytes: usize,
+    budget_bytes: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let token_bound = |text: &String| (text.len() + SPECIAL_TOKEN_SLACK).min(max_length.max(1));
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut padded = 0;
+    for (index, text) in texts.iter().enumerate() {
+        let candidate_padded = padded.max(token_bound(text));
+        let candidate_len = index - start + 1;
+        let attention_bytes = candidate_len
+            .saturating_mul(per_row_bytes)
+            .saturating_mul(candidate_padded)
+            .saturating_mul(candidate_padded);
+        if index > start && (candidate_len > batch_size || attention_bytes > budget_bytes) {
+            batches.push(start..index);
+            start = index;
+            padded = token_bound(text);
+        } else {
+            padded = candidate_padded;
+        }
+    }
+    if start < texts.len() {
+        batches.push(start..texts.len());
+    }
+    batches
 }
 
 fn parse_native_model_id(id: &str) -> Result<&str> {
@@ -255,5 +318,101 @@ fn default_model_cache_dir() -> PathBuf {
             .join(".cache")
             .join("minsync")
             .join("models")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Qwen3-Embedding-0.6B: 16 heads, f32.
+    const QWEN3_F32_ROW: usize = 16 * 4;
+
+    fn texts(lengths: &[usize]) -> Vec<String> {
+        lengths.iter().map(|&len| "a".repeat(len)).collect()
+    }
+
+    fn max_attention_bytes(texts: &[String], batches: &[std::ops::Range<usize>]) -> usize {
+        batches
+            .iter()
+            .map(|range| {
+                let padded = texts[range.clone()]
+                    .iter()
+                    .map(|text| (text.len() + SPECIAL_TOKEN_SLACK).min(DEFAULT_MAX_LENGTH))
+                    .max()
+                    .unwrap();
+                range.len() * QWEN3_F32_ROW * padded * padded
+            })
+            .max()
+            .unwrap()
+    }
+
+    #[test]
+    fn short_texts_keep_configured_batch_size() {
+        let inputs = texts(&[40; 130]);
+        let batches = plan_batches(
+            &inputs,
+            64,
+            DEFAULT_MAX_LENGTH,
+            QWEN3_F32_ROW,
+            ATTENTION_BYTES_BUDGET,
+        );
+        assert_eq!(batches, vec![0..64, 64..128, 128..130]);
+    }
+
+    #[test]
+    fn max_length_inputs_stay_under_budget_and_below_metal_4gib_limit() {
+        // Reproduces the failing shape: 20 chunks that all pad to 2048 tokens
+        // (~5.4 GiB of attention scores in one batch before the fix).
+        let inputs = texts(&[200_000; 20]);
+        let batches = plan_batches(
+            &inputs,
+            64,
+            DEFAULT_MAX_LENGTH,
+            QWEN3_F32_ROW,
+            ATTENTION_BYTES_BUDGET,
+        );
+        assert!(max_attention_bytes(&inputs, &batches) <= ATTENTION_BYTES_BUDGET);
+        assert!(max_attention_bytes(&inputs, &batches) < 1 << 32);
+        assert_eq!(batches.iter().map(|range| range.len()).sum::<usize>(), 20);
+    }
+
+    #[test]
+    fn batches_are_contiguous_and_cover_every_input_in_order() {
+        let inputs = texts(&[10, 5000, 10, 10, 3000, 10, 90_000, 10, 10]);
+        let batches = plan_batches(
+            &inputs,
+            4,
+            DEFAULT_MAX_LENGTH,
+            QWEN3_F32_ROW,
+            ATTENTION_BYTES_BUDGET,
+        );
+        let mut next = 0;
+        for range in &batches {
+            assert_eq!(range.start, next);
+            assert!(!range.is_empty() && range.len() <= 4);
+            next = range.end;
+        }
+        assert_eq!(next, inputs.len());
+        assert!(max_attention_bytes(&inputs, &batches) <= ATTENTION_BYTES_BUDGET);
+    }
+
+    #[test]
+    fn single_oversized_input_still_forms_its_own_batch() {
+        let inputs = texts(&[100_000, 100_000]);
+        let batches = plan_batches(&inputs, 64, 32_768, QWEN3_F32_ROW, ATTENTION_BYTES_BUDGET);
+        assert_eq!(batches, vec![0..1, 1..2]);
+    }
+
+    #[test]
+    fn empty_input_plans_no_batches() {
+        let batches = plan_batches(
+            &[],
+            64,
+            DEFAULT_MAX_LENGTH,
+            QWEN3_F32_ROW,
+            ATTENTION_BYTES_BUDGET,
+        );
+        assert!(batches.is_empty());
     }
 }

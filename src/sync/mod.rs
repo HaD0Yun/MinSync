@@ -813,6 +813,109 @@ mod tests {
         assert_eq!(store.doc_count(), 0);
     }
 
+    /// Emits NaN for the first chunk of every multi-text batch, mimicking a
+    /// GPU backend that corrupts one row of a large batch.
+    struct NanInBatchEmbedder {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for NanInBatchEmbedder {
+        fn id(&self) -> &str {
+            "nan-in-batch"
+        }
+
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut vectors = MockEmbedder.embed(texts).await?;
+            if texts.len() > 1 {
+                vectors[0][3] = f32::NAN;
+            }
+            Ok(vectors)
+        }
+    }
+
+    /// Always emits a non-finite vector for texts containing `poison`.
+    struct PoisonEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for PoisonEmbedder {
+        fn id(&self) -> &str {
+            "poison"
+        }
+
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            let mut vectors = MockEmbedder.embed(texts).await?;
+            for (text, vector) in texts.iter().zip(vectors.iter_mut()) {
+                if text.contains("poison") {
+                    vector[0] = f32::INFINITY;
+                }
+            }
+            Ok(vectors)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_index_file_re_embeds_non_finite_chunk_alone() {
+        let (dir, _sync, chunker, _embedder, mut store) = fixture();
+        let config = Config::default_for("source-1");
+        std::fs::write(
+            dir.path().join("a.txt"),
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron",
+        )
+        .expect("write file");
+        let embedder = NanInBatchEmbedder {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut result = empty_sync_result(false, false);
+        let context = SyncFileContext {
+            config: &config,
+            chunker: &chunker,
+            embedder: &embedder,
+            store: &mut store,
+            sync_token: "token",
+        };
+
+        index_file(dir.path(), "a.txt", context, &mut result)
+            .await
+            .expect("non-finite chunk is repaired by a single-chunk retry");
+
+        assert!(
+            result.chunks_added > 1,
+            "fixture must produce a multi-chunk batch"
+        );
+        assert_eq!(embedder.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(store.doc_count(), result.chunks_added);
+        assert!(store
+            .all_embeddings()
+            .iter()
+            .all(|embedding| embedding.iter().all(|value| value.is_finite())));
+    }
+
+    #[tokio::test]
+    async fn test_index_file_reports_path_for_persistent_non_finite_chunk() {
+        let (dir, _sync, chunker, _embedder, mut store) = fixture();
+        let config = Config::default_for("source-1");
+        std::fs::write(dir.path().join("bad.txt"), "poison").expect("write file");
+        let mut result = empty_sync_result(false, false);
+        let context = SyncFileContext {
+            config: &config,
+            chunker: &chunker,
+            embedder: &PoisonEmbedder,
+            store: &mut store,
+            sync_token: "token",
+        };
+
+        let error = index_file(dir.path(), "bad.txt", context, &mut result)
+            .await
+            .expect_err("persistent non-finite vector must fail");
+
+        let message = error.to_string();
+        assert!(message.contains("bad.txt"), "{message}");
+        assert!(message.contains("chunk 0"), "{message}");
+        assert_eq!(store.doc_count(), 0);
+    }
+
     #[tokio::test]
     async fn test_sync_already_up_to_date() {
         let (dir, sync, chunker, embedder, mut store) = fixture();
