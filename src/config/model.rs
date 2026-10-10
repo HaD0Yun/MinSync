@@ -14,6 +14,47 @@ pub struct Config {
     pub lexical: LexicalConfig,
     #[serde(default)]
     pub normalize: NormalizeConfig,
+    #[serde(default)]
+    pub sync: SyncConfig,
+}
+
+/// Default for [`SyncConfig::checkpoint_every_files`].
+pub const DEFAULT_CHECKPOINT_EVERY_FILES: usize = 50;
+
+/// Default for [`SyncConfig::batch_files`].
+pub const DEFAULT_BATCH_FILES: usize = 25;
+
+/// Knobs for the sync loop itself.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncConfig {
+    /// Every N processed files a running sync checkpoints: it flushes its
+    /// resume log, compacts fragments and prunes old versions, so a sync
+    /// killed mid-way (timeout, crash) neither loses its progress nor leaves
+    /// a store that is slower to reopen.
+    #[serde(default = "default_checkpoint_every_files")]
+    pub checkpoint_every_files: usize,
+    /// Files written to the vector store per commit. Each LanceDB commit
+    /// costs about the same regardless of row count, so larger batches are
+    /// faster; the price is that a crash redoes at most this many files.
+    #[serde(default = "default_batch_files")]
+    pub batch_files: usize,
+}
+
+fn default_checkpoint_every_files() -> usize {
+    DEFAULT_CHECKPOINT_EVERY_FILES
+}
+
+fn default_batch_files() -> usize {
+    DEFAULT_BATCH_FILES
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            checkpoint_every_files: DEFAULT_CHECKPOINT_EVERY_FILES,
+            batch_files: DEFAULT_BATCH_FILES,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -236,6 +277,7 @@ impl Config {
             },
             lexical: LexicalConfig::default(),
             normalize: NormalizeConfig::default(),
+            sync: SyncConfig::default(),
         }
     }
 }

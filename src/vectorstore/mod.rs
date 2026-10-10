@@ -43,11 +43,21 @@ pub struct QueryHit {
 pub enum Filter {
     Eq(String, String),
     Neq(String, String),
+    /// Field equals any of the values; an empty list matches nothing.
+    In(String, Vec<String>),
     And(Vec<Filter>),
 }
 
 pub trait VectorStore: Send + Sync {
     fn upsert(&mut self, docs: &[Document]) -> Result<()>;
+    /// Insert documents whose ids the caller knows are NOT in the store
+    /// (e.g. just checked with [`VectorStore::existing_ids`]). Stores can
+    /// make this a plain append instead of a replace-or-insert. Inserting an
+    /// id that already exists is a caller bug; the default delegates to
+    /// [`VectorStore::upsert`], which stays correct either way.
+    fn insert_new(&mut self, docs: &[Document]) -> Result<()> {
+        self.upsert(docs)
+    }
     fn update(&mut self, updates: &[DocumentUpdate]) -> Result<()>;
     fn fetch(&self, ids: &[String]) -> Result<Vec<Document>>;
     /// Return a stored embedding for each of `content_hashes` that already
@@ -61,11 +71,24 @@ pub trait VectorStore: Send + Sync {
     ) -> Result<std::collections::HashMap<String, Vec<f32>>> {
         Ok(std::collections::HashMap::new())
     }
+    /// Which of `ids` are present. Stores should avoid materializing full
+    /// rows (vectors, text) for what is only an existence check.
+    fn existing_ids(&self, ids: &[String]) -> Result<std::collections::HashSet<String>> {
+        Ok(self.fetch(ids)?.into_iter().map(|doc| doc.id).collect())
+    }
     fn delete_by_filter(&mut self, filter: &Filter) -> Result<usize>;
     fn query(&self, vector: &[f32], filter: Option<&Filter>, topk: usize) -> Result<Vec<QueryHit>>;
     fn query_text(&self, text: &str, filter: Option<&Filter>, topk: usize)
         -> Result<Vec<QueryHit>>;
     fn flush(&mut self) -> Result<()>;
+    /// Cheap mid-sync maintenance so a long run that is killed leaves a
+    /// store that is still fast to reopen: compact once fragments pile up
+    /// and prune old versions. Unlike [`VectorStore::flush`] it never
+    /// retrains or rebuilds search indexes. Stores with nothing to maintain
+    /// keep the default no-op.
+    fn checkpoint(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn doc_count(&self) -> usize;
     fn all_paths(&self) -> Vec<String>;
     fn index_state(&self) -> Result<Option<IndexState>> {

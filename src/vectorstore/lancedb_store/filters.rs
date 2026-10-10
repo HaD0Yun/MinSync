@@ -28,6 +28,18 @@ pub fn filter_to_sql(filter: &Filter) -> Result<String> {
             validate_filter_field(field)?,
             escape_sql_literal(value)
         )),
+        Filter::In(field, values) if values.is_empty() => {
+            validate_filter_field(field)?;
+            Ok("FALSE".to_string())
+        }
+        Filter::In(field, values) => {
+            let literals = values
+                .iter()
+                .map(|value| format!("'{}'", escape_sql_literal(value)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Ok(format!("{} IN ({literals})", validate_filter_field(field)?))
+        }
         Filter::And(filters) if filters.is_empty() => Ok("TRUE".to_string()),
         Filter::And(filters) => filters
             .iter()
@@ -57,10 +69,6 @@ pub(super) fn column_in_filter<'a>(column: &str, values: impl Iterator<Item = &'
         .collect::<Vec<_>>()
         .join(", ");
     format!("{column} IN ({values})")
-}
-
-pub(super) fn sql_literal(value: &str) -> String {
-    format!("'{}'", escape_sql_literal(value))
 }
 
 pub(super) fn escape_sql_literal(value: &str) -> String {
@@ -103,9 +111,20 @@ mod tests {
     }
 
     #[test]
-    fn test_sql_literal_quotes_and_escapes() {
-        assert_eq!(sql_literal("plain"), "'plain'");
-        assert_eq!(sql_literal("it's"), "'it''s'");
+    fn test_in_filter_sql_escapes_and_empty_matches_nothing() {
+        assert_eq!(
+            filter_to_sql(&Filter::In(
+                "path".to_string(),
+                vec!["a.txt".to_string(), "o'brien.txt".to_string()]
+            ))
+            .expect("sql"),
+            "path IN ('a.txt', 'o''brien.txt')"
+        );
+        assert_eq!(
+            filter_to_sql(&Filter::In("path".to_string(), vec![])).expect("sql"),
+            "FALSE"
+        );
+        assert!(filter_to_sql(&Filter::In("bad".to_string(), vec![])).is_err());
     }
 
     #[test]
