@@ -199,6 +199,10 @@ impl VectorStore for LanceDbStore {
         self.request(|resp| Command::Fetch(ids.to_vec(), resp))
     }
 
+    fn documents(&self) -> Result<Vec<Document>> {
+        self.request(Command::Documents)
+    }
+
     fn delete_by_filter(&mut self, filter: &Filter) -> Result<usize> {
         self.request(|resp| Command::Delete(filter.clone(), resp))
     }

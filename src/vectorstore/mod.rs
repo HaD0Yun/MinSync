@@ -60,6 +60,9 @@ pub trait VectorStore: Send + Sync {
     }
     fn update(&mut self, updates: &[DocumentUpdate]) -> Result<()>;
     fn fetch(&self, ids: &[String]) -> Result<Vec<Document>>;
+    fn documents(&self) -> Result<Vec<Document>> {
+        Ok(Vec::new())
+    }
     /// Which of `ids` are present. Stores should avoid materializing full
     /// rows (vectors, text) for what is only an existence check.
     fn existing_ids(&self, ids: &[String]) -> Result<std::collections::HashSet<String>> {
