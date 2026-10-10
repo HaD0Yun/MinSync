@@ -1,5 +1,11 @@
-//! Per-file indexing: read, normalize, chunk, derive doc IDs, embed only
-//! missing chunks, upsert, and sweep stale chunks for that file.
+//! Batch indexing: read, normalize, chunk and derive doc IDs for a group of
+//! files, embed every missing chunk of the group in one call, and write the
+//! whole group to the store with one commit per kind of write.
+//!
+//! Per batch of N files the store sees exactly: one `existing_ids`, one
+//! `update` (reused chunks), one `insert_new` (new chunks), one stale-chunk
+//! sweep, and one delete for removed files. The cost of a LanceDB write is
+//! dominated by the commit, not the rows, so N files cost about what one did.
 
 use crate::chunker::Chunker;
 use crate::config::Config;
@@ -7,7 +13,7 @@ use crate::embedder::Embedder;
 use crate::error::{MinSyncError, Result};
 use crate::id::doc_ids_for_chunks;
 use crate::normalize::normalize_text;
-use crate::types::SyncResult;
+use crate::types::{Chunk, SyncResult};
 use crate::vectorstore::{Document, DocumentUpdate, Filter, VectorStore};
 use std::collections::HashSet;
 use std::path::Path;
@@ -20,75 +26,131 @@ pub(super) struct SyncFileContext<'a> {
     pub sync_token: &'a str,
 }
 
-pub(super) async fn index_file(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BatchKind {
+    /// Added or modified file: (re)index its chunks.
+    Index,
+    /// File removed from the tree: drop all of its chunks.
+    Delete,
+}
+
+pub(super) struct BatchItem {
+    pub path: String,
+    pub kind: BatchKind,
+    /// A resumed run already committed this path with older content. Its
+    /// rows carry the reused sync token, so the stale sweep cannot tell them
+    /// from fresh ones: clear the path before indexing.
+    pub purge_first: bool,
+}
+
+struct PreparedFile<'a> {
+    path: &'a str,
+    chunks: Vec<(Chunk, String, String)>,
+}
+
+fn path_filter(source_id: &str, paths: Vec<String>) -> Filter {
+    Filter::And(vec![
+        Filter::Eq("source_id".to_string(), source_id.to_string()),
+        Filter::In("path".to_string(), paths),
+    ])
+}
+
+/// Index/delete `items` as one unit. On success every item is fully
+/// committed; on error nothing is recorded as processed in `result`.
+pub(super) async fn index_batch(
     root: &Path,
-    path: &str,
+    items: &[BatchItem],
     context: SyncFileContext<'_>,
     result: &mut SyncResult,
 ) -> Result<()> {
-    let raw_text = match std::fs::read_to_string(root.join(path)) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => String::new(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            result.chunks_deleted += context.store.delete_by_filter(&Filter::And(vec![
-                Filter::Eq("source_id".to_string(), context.config.source_id.clone()),
-                Filter::Eq("path".to_string(), path.to_string()),
-            ]))?;
-            result.files_processed += 1;
-            result.files_processed_paths.push(path.to_string());
-            return Ok(());
-        }
-        Err(error) => return Err(MinSyncError::Io(error)),
-    };
-    let text = normalize_text(&raw_text, &context.config.normalize);
-    let chunks = context.chunker.chunk(&text, path)?;
+    let source_id = context.config.source_id.as_str();
     let schema_id = context.chunker.schema_id();
-    let doc_ids = doc_ids_for_chunks(&context.config.source_id, path, schema_id, &chunks);
-    let existing_ids: HashSet<_> = context
-        .store
-        .fetch(
-            &doc_ids
-                .iter()
-                .map(|(doc_id, _)| doc_id.clone())
-                .collect::<Vec<_>>(),
-        )?
-        .into_iter()
-        .map(|doc| doc.id)
-        .collect();
-    let mut docs_to_embed = Vec::new();
-    let mut reused = Vec::new();
 
-    for (chunk, (doc_id, chunk_content_hash)) in chunks.into_iter().zip(doc_ids) {
-        if existing_ids.contains(&doc_id) {
-            reused.push(DocumentUpdate {
-                id: doc_id,
-                seen_token: context.sync_token.to_string(),
-                path: path.to_string(),
-                heading_path: chunk.heading_path,
-            });
-        } else {
-            docs_to_embed.push(Document {
-                id: doc_id,
-                embedding: Vec::new(),
-                text: chunk.text,
-                source_id: context.config.source_id.clone(),
-                path: path.to_string(),
-                chunk_schema_id: schema_id.to_string(),
-                chunk_type: chunk.chunk_type,
-                heading_path: chunk.heading_path,
-                content_hash: chunk_content_hash,
-                seen_token: context.sync_token.to_string(),
-            });
+    let purge: Vec<String> = items
+        .iter()
+        .filter(|item| item.purge_first)
+        .map(|item| item.path.clone())
+        .collect();
+    let mut chunks_deleted = 0;
+    if !purge.is_empty() {
+        chunks_deleted += context
+            .store
+            .delete_by_filter(&path_filter(source_id, purge))?;
+    }
+
+    // Read + chunk + id every file; files that vanished since the scan are
+    // handled like deletions.
+    let mut delete_paths: Vec<String> = Vec::new();
+    let mut prepared: Vec<PreparedFile<'_>> = Vec::new();
+    for item in items {
+        if item.kind == BatchKind::Delete {
+            delete_paths.push(item.path.clone());
+            continue;
+        }
+        let raw_text = match std::fs::read_to_string(root.join(&item.path)) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => String::new(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                delete_paths.push(item.path.clone());
+                continue;
+            }
+            Err(error) => return Err(MinSyncError::Io(error)),
+        };
+        let text = normalize_text(&raw_text, &context.config.normalize);
+        let chunks = context.chunker.chunk(&text, &item.path)?;
+        let ids = doc_ids_for_chunks(source_id, &item.path, schema_id, &chunks);
+        prepared.push(PreparedFile {
+            path: &item.path,
+            chunks: chunks
+                .into_iter()
+                .zip(ids)
+                .map(|(chunk, (doc_id, content_hash))| (chunk, doc_id, content_hash))
+                .collect(),
+        });
+    }
+
+    // One id-only existence check for the whole batch.
+    let all_ids: Vec<String> = prepared
+        .iter()
+        .flat_map(|file| file.chunks.iter().map(|(_, doc_id, _)| doc_id.clone()))
+        .collect();
+    let existing: HashSet<String> = context.store.existing_ids(&all_ids)?;
+
+    let mut reused: Vec<DocumentUpdate> = Vec::new();
+    let mut docs_to_embed: Vec<Document> = Vec::new();
+    // Position of each new chunk within its own file, for error messages.
+    let mut chunk_in_file: Vec<usize> = Vec::new();
+    for file in prepared {
+        let mut new_in_file = 0;
+        for (chunk, doc_id, content_hash) in file.chunks {
+            if existing.contains(&doc_id) {
+                reused.push(DocumentUpdate {
+                    id: doc_id,
+                    seen_token: context.sync_token.to_string(),
+                    path: file.path.to_string(),
+                    heading_path: chunk.heading_path,
+                });
+            } else {
+                docs_to_embed.push(Document {
+                    id: doc_id,
+                    embedding: Vec::new(),
+                    text: chunk.text,
+                    source_id: source_id.to_string(),
+                    path: file.path.to_string(),
+                    chunk_schema_id: schema_id.to_string(),
+                    chunk_type: chunk.chunk_type,
+                    heading_path: chunk.heading_path,
+                    content_hash,
+                    seen_token: context.sync_token.to_string(),
+                });
+                chunk_in_file.push(new_in_file);
+                new_in_file += 1;
+            }
         }
     }
 
-    // One store call (one commit) for every reused chunk of the file,
-    // instead of one commit per chunk.
-    if !reused.is_empty() {
-        context.store.update(&reused)?;
-        result.chunks_updated += reused.len();
-    }
-
+    // Embed first: the slow, fallible step runs before any write, so a
+    // failure leaves the store untouched by this batch.
     if !docs_to_embed.is_empty() {
         let texts: Vec<String> = docs_to_embed.iter().map(|doc| doc.text.clone()).collect();
         let mut embeddings = context.embedder.embed(&texts).await?;
@@ -104,8 +166,8 @@ pub(super) async fn index_file(
             &texts,
             &mut embeddings,
             context.config.embedder.max_retries,
-            path,
             &docs_to_embed,
+            &chunk_in_file,
         )
         .await?;
 
@@ -115,22 +177,45 @@ pub(super) async fn index_file(
             .iter()
             .map(|text| estimate_tokens(text))
             .sum::<usize>();
-
         for (doc, embedding) in docs_to_embed.iter_mut().zip(embeddings) {
             doc.embedding = embedding;
         }
-        result.chunks_added += docs_to_embed.len();
-        context.store.upsert(&docs_to_embed)?;
     }
 
-    result.chunks_deleted += context.store.delete_by_filter(&Filter::And(vec![
-        Filter::Eq("source_id".to_string(), context.config.source_id.clone()),
-        Filter::Eq("path".to_string(), path.to_string()),
-        Filter::Neq("seen_token".to_string(), context.sync_token.to_string()),
-    ]))?;
-    result.files_processed += 1;
-    result.files_processed_paths.push(path.to_string());
+    if !reused.is_empty() {
+        context.store.update(&reused)?;
+        result.chunks_updated += reused.len();
+    }
+    if !docs_to_embed.is_empty() {
+        context.store.insert_new(&docs_to_embed)?;
+        result.chunks_added += docs_to_embed.len();
+    }
 
+    // Stale chunks of every indexed file (content changed: old ids no longer
+    // carry this run's token) in one sweep, then removed files in one delete.
+    let indexed_paths: Vec<String> = items
+        .iter()
+        .filter(|item| item.kind == BatchKind::Index && !delete_paths.contains(&item.path))
+        .map(|item| item.path.clone())
+        .collect();
+    if !indexed_paths.is_empty() {
+        chunks_deleted += context.store.delete_by_filter(&Filter::And(vec![
+            Filter::Eq("source_id".to_string(), source_id.to_string()),
+            Filter::In("path".to_string(), indexed_paths),
+            Filter::Neq("seen_token".to_string(), context.sync_token.to_string()),
+        ]))?;
+    }
+    if !delete_paths.is_empty() {
+        chunks_deleted += context
+            .store
+            .delete_by_filter(&path_filter(source_id, delete_paths))?;
+    }
+
+    result.chunks_deleted += chunks_deleted;
+    result.files_processed += items.len();
+    result
+        .files_processed_paths
+        .extend(items.iter().map(|item| item.path.clone()));
     Ok(())
 }
 
@@ -143,7 +228,7 @@ fn is_finite_embedding(embedding: &[f32]) -> bool {
 /// Local GPU backends can emit non-finite values for a single chunk inside a
 /// large batch without the input itself being invalid, so re-embedding it
 /// alone usually yields a valid vector. Without this, one bad vector aborts
-/// the whole sync at upsert time. Chunks that stay non-finite after
+/// the whole sync at write time. Chunks that stay non-finite after
 /// `max_retries` single-text attempts fail with the file path and chunk index
 /// so the offending file can be inspected or excluded.
 async fn repair_non_finite_embeddings(
@@ -151,19 +236,21 @@ async fn repair_non_finite_embeddings(
     texts: &[String],
     embeddings: &mut [Vec<f32>],
     max_retries: usize,
-    path: &str,
     docs: &[Document],
+    chunk_in_file: &[usize],
 ) -> Result<()> {
     for index in 0..embeddings.len() {
         if is_finite_embedding(&embeddings[index]) {
             continue;
         }
+        let path = docs[index].path.as_str();
+        let chunk = chunk_in_file[index];
         let mut attempts = 0;
         while attempts < max_retries.max(1) && !is_finite_embedding(&embeddings[index]) {
             attempts += 1;
             tracing::warn!(
                 path,
-                chunk_index = index,
+                chunk_index = chunk,
                 attempt = attempts,
                 "embedding contains non-finite values; re-embedding chunk alone"
             );
@@ -171,7 +258,7 @@ async fn repair_non_finite_embeddings(
         }
         if !is_finite_embedding(&embeddings[index]) {
             return Err(MinSyncError::Embedding(format!(
-                "embedding for {path} (chunk {index}, document {}) contains non-finite values after {attempts} single-chunk retries",
+                "embedding for {path} (chunk {chunk}, document {}) contains non-finite values after {attempts} single-chunk retries",
                 docs[index].id
             )));
         }

@@ -187,6 +187,14 @@ impl VectorStore for LanceDbStore {
         self.request(|resp| Command::Update(updates.to_vec(), resp))
     }
 
+    fn insert_new(&mut self, docs: &[Document]) -> Result<()> {
+        self.request(|resp| Command::InsertNew(docs.to_vec(), resp))
+    }
+
+    fn existing_ids(&self, ids: &[String]) -> Result<std::collections::HashSet<String>> {
+        self.request(|resp| Command::ExistingIds(ids.to_vec(), resp))
+    }
+
     fn fetch(&self, ids: &[String]) -> Result<Vec<Document>> {
         self.request(|resp| Command::Fetch(ids.to_vec(), resp))
     }
@@ -859,5 +867,83 @@ mod tests {
         store.checkpoint().expect("checkpoint");
         assert_eq!(store.fragment_count().expect("fragments"), before);
         assert_eq!(store.doc_count(), 3);
+    }
+
+    #[test]
+    fn test_existing_ids_returns_only_present_ids() {
+        let (_dir, mut store) = store();
+        store
+            .upsert(&[
+                doc("a", "a.txt", "t", vec![1.0, 0.0, 0.0, 0.0]),
+                doc("b", "a.txt", "t", vec![0.0, 1.0, 0.0, 0.0]),
+            ])
+            .expect("seed");
+        let found = store
+            .existing_ids(&["a".to_string(), "ghost".to_string(), "b".to_string()])
+            .expect("existing ids");
+        assert_eq!(found.len(), 2);
+        assert!(found.contains("a") && found.contains("b"));
+        assert!(store.existing_ids(&[]).expect("empty").is_empty());
+    }
+
+    #[test]
+    fn test_existing_ids_is_not_truncated_for_large_id_lists() {
+        // A silently truncated existence check would make `insert_new`
+        // append duplicates of chunks that are already stored.
+        let (_dir, mut store) = store();
+        let docs: Vec<_> = (0..1500)
+            .map(|i| doc(&format!("id-{i}"), "a.txt", "t", vec![1.0, 0.0, 0.0, 0.0]))
+            .collect();
+        store.upsert(&docs).expect("seed");
+        let mut ids: Vec<String> = (0..1500).map(|i| format!("id-{i}")).collect();
+        ids.push("ghost".to_string());
+        let found = store.existing_ids(&ids).expect("existing ids");
+        assert_eq!(found.len(), 1500);
+        assert!(!found.contains("ghost"));
+    }
+
+    #[test]
+    fn test_insert_new_appends_in_one_commit_without_scanning() {
+        let (dir, mut store) = store();
+        store
+            .upsert(&[doc("seed", "a.txt", "t", vec![1.0, 0.0, 0.0, 0.0])])
+            .expect("seed");
+        let before = version_count(&dir);
+        let docs: Vec<_> = (0..25)
+            .map(|i| doc(&format!("n-{i}"), "b.txt", "t", vec![0.0, 1.0, 0.0, 0.0]))
+            .collect();
+        store.insert_new(&docs).expect("insert new");
+        assert_eq!(version_count(&dir) - before, 1);
+        assert_eq!(store.doc_count(), 26);
+        let found = store.fetch(&["n-24".to_string()]).expect("fetch inserted");
+        assert_eq!(found[0].path, "b.txt");
+    }
+
+    #[test]
+    fn test_insert_new_rejects_non_finite_embedding() {
+        let (_dir, mut store) = store();
+        let bad = doc("a", "a.txt", "t", vec![f32::NAN, 0.0, 0.0, 0.0]);
+        assert!(store.insert_new(&[bad]).is_err());
+        assert_eq!(store.doc_count(), 0);
+    }
+
+    #[test]
+    fn test_delete_by_in_filter() {
+        let (_dir, mut store) = store();
+        store
+            .upsert(&[
+                doc("a", "x.txt", "t", vec![1.0, 0.0, 0.0, 0.0]),
+                doc("b", "y.txt", "t", vec![0.0, 1.0, 0.0, 0.0]),
+                doc("c", "z.txt", "t", vec![0.0, 0.0, 1.0, 0.0]),
+            ])
+            .expect("seed");
+        let deleted = store
+            .delete_by_filter(&Filter::In(
+                "path".to_string(),
+                vec!["x.txt".to_string(), "z.txt".to_string()],
+            ))
+            .expect("delete in");
+        assert_eq!(deleted, 2);
+        assert_eq!(store.all_paths(), vec!["y.txt"]);
     }
 }

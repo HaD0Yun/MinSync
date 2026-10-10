@@ -111,6 +111,22 @@ impl LanceDbInner {
         self.merge_by_id(batch, true).await
     }
 
+    /// Append documents the caller knows are absent: a plain `add`, ~5x
+    /// cheaper than `merge_insert`, which has to join against the table.
+    pub(super) async fn insert_new(&self, docs: Vec<Document>) -> Result<()> {
+        if docs.is_empty() {
+            return Ok(());
+        }
+        let docs = dedupe_documents(docs);
+        let batch = docs_to_batch(&docs, self.dim, &self.language)?;
+        self.table
+            .add(batch)
+            .execute()
+            .await
+            .map_err(to_store_error)?;
+        Ok(())
+    }
+
     /// Rewrite `seen_token`/`path`/`heading_path` for every listed id in ONE
     /// commit. Ids not present in the table are ignored, never inserted.
     pub(super) async fn update(&self, updates: Vec<DocumentUpdate>) -> Result<()> {
@@ -153,6 +169,32 @@ impl LanceDbInner {
         let mut docs = self.scan_documents(Some(filter)).await?;
         docs.sort_by_key(|doc| ids.iter().position(|id| *id == doc.id).unwrap_or(ids.len()));
         Ok(docs)
+    }
+
+    /// Existence check that projects only `id`: no vectors or text are read.
+    pub(super) async fn existing_ids(&self, ids: Vec<String>) -> Result<HashSet<String>> {
+        if ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let batches: Vec<RecordBatch> = self
+            .table
+            .query()
+            .only_if(id_in_filter(ids.iter().map(String::as_str)))
+            .select(Select::Columns(vec!["id".to_string()]))
+            .execute()
+            .await
+            .map_err(to_store_error)?
+            .try_collect()
+            .await
+            .map_err(to_store_error)?;
+        let mut found = HashSet::new();
+        for batch in &batches {
+            let column = string_col(batch, "id")?;
+            for row in 0..batch.num_rows() {
+                found.insert(column.value(row).to_string());
+            }
+        }
+        Ok(found)
     }
 
     pub(super) async fn delete_by_filter(&self, filter: Filter) -> Result<usize> {

@@ -226,10 +226,11 @@ Agents adding another vector store should implement the `VectorStore` trait and 
 
 ### Write path, checkpoints and `optimize`
 
-A sync writes each file with one commit per operation (batched metadata update, one replace-or-insert for new chunks), keeps BTree indexes on `id` and `path` so per-file filters stay index lookups, and every `[sync] checkpoint_every_files` files (default 50) compacts fragments (once there are at least `compact_fragment_threshold`, default 64) and prunes old versions. A running sync logs `sync progress` at each checkpoint.
+A sync writes files in batches of `[sync] batch_files` (default 25). Per batch it does one id-only existence check, one embedding call, one metadata update for reused chunks, one append for new chunks and one stale-chunk sweep, so the commit count is independent of how many files are in the batch. It keeps BTree indexes on `id` and `path` so these filters stay index lookups, and every `[sync] checkpoint_every_files` files (default 50) compacts fragments (once there are at least `compact_fragment_threshold`, default 64) and prunes old versions. A running sync logs `sync progress` at each checkpoint. A crash redoes at most one batch.
 
 ```toml
 [sync]
+batch_files = 25              # files per store commit; 1 = per-file commits
 checkpoint_every_files = 50   # 0 disables mid-sync checkpoints
 
 [vectorstore.options]

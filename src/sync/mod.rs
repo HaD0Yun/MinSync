@@ -14,7 +14,7 @@ use crate::manifest::{FileChange, Manifest};
 use crate::state::{Cursor, FileLock, Transaction};
 use crate::types::SyncResult;
 use crate::vectorstore::{Filter, VectorStore};
-use indexer::{index_file, SyncFileContext};
+use indexer::{index_batch, BatchItem, BatchKind, SyncFileContext};
 use progress::{ProgressHeader, ProgressLog, PROGRESS_FILE};
 use result::{change_path, empty_sync_result};
 use sha2::{Digest, Sha256};
@@ -349,14 +349,18 @@ impl MinSync {
         let checkpoint_every = self
             .checkpoint_every
             .unwrap_or(config.sync.checkpoint_every_files);
-        let mut processed_this_run = 0usize;
+        let batch_files = config.sync.batch_files.max(1);
 
+        // Classify every change once: count it, and queue what still has to
+        // be written (resumed files are already committed).
+        let mut pending: Vec<(BatchItem, Option<String>)> = Vec::new();
         for change in &changes {
-            let (path, content_hash) = match change {
+            let (path, kind, content_hash) = match change {
                 FileChange::Added(path) => {
                     result.files_added += 1;
                     (
                         path,
+                        BatchKind::Index,
                         new_manifest.files.get(path).map(|e| e.content_hash.clone()),
                     )
                 }
@@ -364,12 +368,13 @@ impl MinSync {
                     result.files_modified += 1;
                     (
                         path,
+                        BatchKind::Index,
                         new_manifest.files.get(path).map(|e| e.content_hash.clone()),
                     )
                 }
                 FileChange::Deleted(path) => {
                     result.files_deleted += 1;
-                    (path, None)
+                    (path, BatchKind::Delete, None)
                 }
             };
             if resume
@@ -379,46 +384,65 @@ impl MinSync {
                 result.files_resumed += 1;
                 continue;
             }
-            // Logged by the interrupted run but changed since: its old rows
-            // carry the reused token, so the per-file `seen_token !=` sweep
-            // cannot tell them from fresh ones. Clear the path first.
-            if resume
-                .as_ref()
-                .is_some_and(|state| state.processed.contains_key(path))
-            {
-                result.chunks_deleted += store.delete_by_filter(&Filter::And(vec![
-                    Filter::Eq("source_id".to_string(), config.source_id.clone()),
-                    Filter::Eq("path".to_string(), path.clone()),
-                ]))?;
-            }
+            pending.push((
+                BatchItem {
+                    path: path.clone(),
+                    kind,
+                    // Logged by the interrupted run but changed since: its old
+                    // rows carry the reused token, so the stale sweep cannot
+                    // tell them from fresh ones. Clear the path first.
+                    purge_first: resume
+                        .as_ref()
+                        .is_some_and(|state| state.processed.contains_key(path)),
+                },
+                content_hash,
+            ));
+        }
 
-            match change {
-                FileChange::Added(_) | FileChange::Modified(_) => {
-                    let context = SyncFileContext {
-                        config: &config,
-                        chunker,
-                        embedder,
-                        store,
-                        sync_token: &sync_token,
-                    };
-                    index_file(&self.root, path, context, &mut result).await?;
-                }
-                FileChange::Deleted(_) => {
-                    let deleted = store.delete_by_filter(&Filter::And(vec![
-                        Filter::Eq("source_id".to_string(), config.source_id.clone()),
-                        Filter::Eq("path".to_string(), path.clone()),
-                    ]))?;
-                    result.chunks_deleted += deleted;
-                    result.files_processed += 1;
-                    result.files_processed_paths.push(path.clone());
-                }
-            }
+        let mut processed_this_run = 0usize;
+        let mut since_checkpoint = 0usize;
+        let mut cursor_at = 0usize;
+        while cursor_at < pending.len() {
+            // Never let a batch straddle a checkpoint boundary, so the
+            // checkpoint cadence stays exactly `checkpoint_every` files.
+            let room = if checkpoint_every > 0 {
+                checkpoint_every - since_checkpoint
+            } else {
+                usize::MAX
+            };
+            let take = batch_files.min(room).min(pending.len() - cursor_at);
+            let group = &pending[cursor_at..cursor_at + take];
+            cursor_at += take;
+
+            let items: Vec<BatchItem> = group
+                .iter()
+                .map(|(item, _)| BatchItem {
+                    path: item.path.clone(),
+                    kind: item.kind,
+                    purge_first: item.purge_first,
+                })
+                .collect();
+            let context = SyncFileContext {
+                config: &config,
+                chunker,
+                embedder,
+                store,
+                sync_token: &sync_token,
+            };
+            index_batch(&self.root, &items, context, &mut result).await?;
 
             // Logged only after the store commits returned: a logged path is
-            // always safe to skip on resume.
-            progress.append(&[(path.clone(), content_hash)])?;
-            processed_this_run += 1;
-            if checkpoint_every > 0 && processed_this_run.is_multiple_of(checkpoint_every) {
+            // always safe to skip on resume. One fsync for the whole batch.
+            let logged: Vec<(String, Option<String>)> = group
+                .iter()
+                .map(|(item, hash)| (item.path.clone(), hash.clone()))
+                .collect();
+            progress.append(&logged)?;
+
+            processed_this_run += take;
+            since_checkpoint += take;
+            if checkpoint_every > 0 && since_checkpoint >= checkpoint_every {
+                since_checkpoint = 0;
                 store.checkpoint()?;
                 tracing::info!(
                     processed = processed_this_run + result.files_resumed,
@@ -461,9 +485,24 @@ mod tests {
     use super::*;
     use crate::chunker::chonkie::ChonkieChunker;
     use crate::embedder::Embedder;
-    use crate::sync::indexer::{index_file, SyncFileContext};
+    use crate::sync::indexer::{index_batch, BatchItem, BatchKind, SyncFileContext};
     use crate::vectorstore::memory::InMemoryStore;
     use tempfile::TempDir;
+
+    /// Single-file convenience over [`index_batch`] for per-file tests.
+    async fn index_file(
+        root: &Path,
+        path: &str,
+        context: SyncFileContext<'_>,
+        result: &mut SyncResult,
+    ) -> Result<()> {
+        let item = BatchItem {
+            path: path.to_string(),
+            kind: BatchKind::Index,
+            purge_first: false,
+        };
+        index_batch(root, &[item], context, result).await
+    }
 
     struct MockEmbedder;
 
@@ -1127,9 +1166,18 @@ mod tests {
         inner: InMemoryStore,
         update_batch_sizes: Vec<usize>,
         upsert_calls: usize,
+        insert_calls: usize,
+        delete_calls: usize,
+        existing_ids_calls: AtomicUsize,
         checkpoints: usize,
-        /// Fail every `upsert` once this many have succeeded.
+        /// Fail every write of new rows once this many have succeeded.
         fail_upserts_after: Option<usize>,
+    }
+
+    impl SpyStore {
+        fn checks(&self) -> usize {
+            self.existing_ids_calls.load(Ordering::SeqCst)
+        }
     }
 
     impl VectorStore for SpyStore {
@@ -1143,6 +1191,21 @@ mod tests {
             self.upsert_calls += 1;
             self.inner.upsert(docs)
         }
+        fn insert_new(&mut self, docs: &[Document]) -> Result<()> {
+            if self
+                .fail_upserts_after
+                .is_some_and(|n| self.upsert_calls >= n)
+            {
+                return Err(MinSyncError::VectorStore("injected crash".into()));
+            }
+            self.upsert_calls += 1;
+            self.insert_calls += 1;
+            self.inner.upsert(docs)
+        }
+        fn existing_ids(&self, ids: &[String]) -> Result<std::collections::HashSet<String>> {
+            self.existing_ids_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.inner.fetch(ids)?.into_iter().map(|d| d.id).collect())
+        }
         fn update(&mut self, updates: &[DocumentUpdate]) -> Result<()> {
             self.update_batch_sizes.push(updates.len());
             self.inner.update(updates)
@@ -1151,6 +1214,7 @@ mod tests {
             self.inner.fetch(ids)
         }
         fn delete_by_filter(&mut self, filter: &Filter) -> Result<usize> {
+            self.delete_calls += 1;
             self.inner.delete_by_filter(filter)
         }
         fn query(
@@ -1272,6 +1336,150 @@ mod tests {
         assert_eq!(store.checkpoints, 2, "after file 2 and file 4 of 5");
     }
 
+    fn set_batch_files(sync: &MinSync, files: usize) {
+        let path = sync.minsync_dir.join("config.toml");
+        let mut config = Config::load(&path).expect("load config");
+        config.sync.batch_files = files;
+        config.save(&path).expect("save config");
+    }
+
+    /// Store write calls of an initial sync over `files` files (all new).
+    async fn initial_sync_calls(files: usize) -> (SpyStore, SyncResult) {
+        let (dir, sync, chunker, embedder, _store) = fixture();
+        write_numbered_files(&dir, files);
+        init_sync(&sync);
+        let mut store = SpyStore::default();
+        let result = sync
+            .sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("sync");
+        (store, result)
+    }
+
+    #[tokio::test]
+    async fn test_store_write_calls_do_not_grow_with_files_in_a_batch() {
+        let (small, small_result) = initial_sync_calls(4).await;
+        let (large, large_result) = initial_sync_calls(20).await;
+
+        assert_eq!(small_result.files_processed, 4);
+        assert_eq!(large_result.files_processed, 20);
+        assert_eq!(
+            (small.checks(), small.insert_calls, small.delete_calls),
+            (large.checks(), large.insert_calls, large.delete_calls),
+            "one existence check, one insert and the same sweeps for 4 or 20 files"
+        );
+        assert_eq!(large.checks(), 1);
+        assert_eq!(large.insert_calls, 1);
+        assert!(large.update_batch_sizes.is_empty());
+        assert_eq!(
+            large_result.embedding_api_calls, 1,
+            "one embed call per batch"
+        );
+        assert_eq!(large.inner.all_paths().len(), 20);
+    }
+
+    #[tokio::test]
+    async fn test_modified_files_reuse_chunks_in_one_update_per_batch() {
+        let (dir, sync, chunker, embedder, _store) = fixture();
+        write_numbered_files(&dir, 10);
+        init_sync(&sync);
+        let mut store = SpyStore::default();
+        sync.sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("initial sync");
+        let (updates_before, inserts_before, checks_before) = (
+            store.update_batch_sizes.len(),
+            store.insert_calls,
+            store.checks(),
+        );
+        for i in 0..10 {
+            let path = dir.path().join(format!("f{i}.txt"));
+            let mut text = std::fs::read_to_string(&path).expect("read");
+            text.push_str(" extra tail words appended after the crash point");
+            std::fs::write(path, text).expect("modify");
+        }
+
+        let result = sync
+            .sync(&chunker, &embedder, &mut store, false, false, false)
+            .await
+            .expect("incremental sync");
+
+        assert_eq!(result.files_modified, 10);
+        assert!(result.chunks_updated > 0, "unchanged chunks are reused");
+        assert_eq!(store.checks() - checks_before, 1);
+        assert_eq!(store.update_batch_sizes.len() - updates_before, 1);
+        assert_eq!(store.insert_calls - inserts_before, 1);
+        assert_eq!(
+            *store.update_batch_sizes.last().expect("update batch"),
+            result.chunks_updated,
+            "all reused chunks of all 10 files in one update"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_size_one_writes_each_file_separately() {
+        let (dir, sync, chunker, embedder, _store) = fixture();
+        write_numbered_files(&dir, 5);
+        init_sync(&sync);
+        set_batch_files(&sync, 1);
+        let mut store = SpyStore::default();
+
+        sync.sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("sync");
+
+        assert_eq!(store.insert_calls, 5);
+        assert_eq!(store.checks(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_batches_never_straddle_a_checkpoint() {
+        let (dir, sync, chunker, embedder, _store) = fixture();
+        let sync = sync.with_checkpoint_every(3);
+        write_numbered_files(&dir, 7);
+        init_sync(&sync);
+        set_batch_files(&sync, 4);
+        let mut store = SpyStore::default();
+
+        sync.sync(&chunker, &embedder, &mut store, true, false, false)
+            .await
+            .expect("sync");
+
+        // groups of 3, 3, 1: a batch of 4 is cut at each checkpoint boundary
+        assert_eq!(store.insert_calls, 3);
+        assert_eq!(store.checkpoints, 2);
+    }
+
+    #[tokio::test]
+    async fn test_crash_mid_batch_redoes_only_the_uncommitted_batch() {
+        let (dir, sync, chunker, _embedder, _store) = fixture();
+        write_numbered_files(&dir, 6);
+        init_sync(&sync);
+        set_batch_files(&sync, 2);
+        let mut store = SpyStore {
+            fail_upserts_after: Some(2),
+            ..SpyStore::default()
+        };
+        sync.sync(&chunker, &MockEmbedder, &mut store, true, false, false)
+            .await
+            .expect_err("third batch crashes");
+        store.fail_upserts_after = None;
+        assert_eq!(store.inner.all_paths().len(), 4, "two batches committed");
+
+        let result = sync
+            .sync(&chunker, &MockEmbedder, &mut store, false, false, false)
+            .await
+            .expect("resume");
+
+        assert_eq!(result.files_resumed, 4);
+        assert_eq!(result.files_processed, 2, "only the failed batch is redone");
+        assert_eq!(store.inner.all_paths().len(), 6);
+        assert_eq!(
+            store.doc_count(),
+            uninterrupted_doc_count(&chunker, 6).await
+        );
+    }
+
     /// Run an initial sync that crashes on the 4th file's upsert.
     async fn crash_initial_sync(
         dir: &TempDir,
@@ -1280,6 +1488,7 @@ mod tests {
     ) -> SpyStore {
         write_numbered_files(dir, 6);
         init_sync(sync);
+        set_batch_files(sync, 1);
         let mut store = SpyStore {
             fail_upserts_after: Some(3),
             ..SpyStore::default()
@@ -1397,6 +1606,7 @@ mod tests {
                 .expect("write file");
         }
         init_sync(&sync);
+        set_batch_files(&sync, 1);
         sync.sync(&chunker, &embedder, &mut store, true, false, false)
             .await
             .expect("initial sync");

@@ -196,10 +196,11 @@ MinSync는 row 수가 `index_build_threshold`를 넘으면 IVF-HNSW-SQ ANN index
 
 ### 쓰기 경로, checkpoint, `optimize`
 
-sync는 파일마다 배치 단위로 commit합니다(재사용 chunk의 metadata는 한 번에 update, 새 chunk는 replace-or-insert 한 번). `id`와 `path`에 BTree index를 유지해 파일별 filter가 fragment 전체 스캔이 되지 않게 하고, `[sync] checkpoint_every_files`(기본 50)개 파일마다 fragment가 `compact_fragment_threshold`(기본 64) 이상이면 compact하고 오래된 version을 prune합니다. 실행 중인 sync는 checkpoint마다 `sync progress`를 로그로 남깁니다.
+sync는 `[sync] batch_files`(기본 25)개 파일씩 묶어서 씁니다. batch마다 id만 읽는 존재 확인 1회, embedding 호출 1회, 재사용 chunk의 metadata update 1회, 새 chunk append 1회, stale chunk sweep 1회만 수행하므로 commit 수가 batch 안의 파일 수와 무관합니다. `id`와 `path`에 BTree index를 유지해 이 filter들이 index lookup으로 처리되게 하고, `[sync] checkpoint_every_files`(기본 50)개 파일마다 fragment가 `compact_fragment_threshold`(기본 64) 이상이면 compact하고 오래된 version을 prune합니다. 실행 중인 sync는 checkpoint마다 `sync progress`를 로그로 남깁니다. 중단되어도 최대 한 batch만 다시 처리합니다.
 
 ```toml
 [sync]
+batch_files = 25              # store commit당 파일 수; 1이면 파일별 commit
 checkpoint_every_files = 50   # 0이면 중간 checkpoint 비활성화
 
 [vectorstore.options]

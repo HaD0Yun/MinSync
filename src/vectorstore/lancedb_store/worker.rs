@@ -15,6 +15,8 @@ pub(super) enum Command {
     Upsert(Vec<Document>, Resp<()>),
     Update(Vec<DocumentUpdate>, Resp<()>),
     Fetch(Vec<String>, Resp<Vec<Document>>),
+    ExistingIds(Vec<String>, Resp<std::collections::HashSet<String>>),
+    InsertNew(Vec<Document>, Resp<()>),
     Delete(Filter, Resp<usize>),
     Query {
         vector: Vec<f32>,
@@ -78,6 +80,12 @@ pub(super) fn run_worker(
                 send_response(resp, rt.block_on(inner.update(updates)))
             }
             Command::Fetch(ids, resp) => send_response(resp, rt.block_on(inner.fetch(ids))),
+            Command::ExistingIds(ids, resp) => {
+                send_response(resp, rt.block_on(inner.existing_ids(ids)))
+            }
+            Command::InsertNew(docs, resp) => {
+                send_response(resp, rt.block_on(inner.insert_new(docs)))
+            }
             Command::Delete(filter, resp) => {
                 send_response(resp, rt.block_on(inner.delete_by_filter(filter)));
             }

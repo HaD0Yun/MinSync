@@ -42,6 +42,8 @@ pub fn matches_filter(doc: &Document, filter: &Filter) -> bool {
         Filter::Neq(field, value) => {
             get_field(doc, field).is_some_and(|doc_value| doc_value != value)
         }
+        Filter::In(field, values) => get_field(doc, field)
+            .is_some_and(|doc_value| values.iter().any(|value| value == doc_value)),
         Filter::And(filters) => filters.iter().all(|nested| matches_filter(doc, nested)),
     }
 }
@@ -129,6 +131,26 @@ mod tests {
         assert!(!matches_filter(
             &doc,
             &Filter::Eq("nonexistent".to_string(), "x".to_string())
+        ));
+    }
+
+    #[test]
+    fn test_matches_filter_in() {
+        let doc = doc();
+        assert!(matches_filter(
+            &doc,
+            &Filter::In(
+                "path".to_string(),
+                vec!["x.txt".to_string(), "a.txt".to_string()]
+            )
+        ));
+        assert!(!matches_filter(
+            &doc,
+            &Filter::In("path".to_string(), vec!["x.txt".to_string()])
+        ));
+        assert!(!matches_filter(
+            &doc,
+            &Filter::In("path".to_string(), vec![])
         ));
     }
 }
