@@ -3,8 +3,9 @@
 use super::filters::{column_in_filter, filter_to_sql, id_in_filter};
 use super::index::{compact_if_fragmented, maintain_index, maintain_scalar_indexes};
 use super::schema::{
-    batch_to_documents, batch_to_fts_hits, batch_to_hash_embeddings, batch_to_query_hits, dedupe_documents, docs_to_batch,
-    schema, string_col, updates_to_batch, validate_schema, validate_vector,
+    batch_to_documents, batch_to_fts_hits, batch_to_hash_embeddings, batch_to_query_hits,
+    dedupe_documents, docs_to_batch, schema, string_col, updates_to_batch, validate_schema,
+    validate_vector,
 };
 use super::{
     to_store_error, IndexingConfig, DISTANCE_COLUMN, DISTANCE_TYPE, TABLE_NAME, VECTOR_COLUMN,
