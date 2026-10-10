@@ -82,6 +82,7 @@ pub(super) async fn index_batch(
     // handled like deletions.
     let mut delete_paths: Vec<String> = Vec::new();
     let mut prepared: Vec<PreparedFile<'_>> = Vec::new();
+    let mut truncated_total = 0;
     for item in items {
         if item.kind == BatchKind::Delete {
             delete_paths.push(item.path.clone());
@@ -98,6 +99,24 @@ pub(super) async fn index_batch(
         };
         let text = normalize_text(&raw_text, &context.config.normalize);
         let chunks = context.chunker.chunk(&text, &item.path)?;
+        let chunk_texts: Vec<String> = chunks.iter().map(|chunk| chunk.text.clone()).collect();
+        let chunks_truncated = context.embedder.count_truncated(&chunk_texts).await?;
+        if chunks_truncated > 0 {
+            if let Some(max_length) = context.embedder.max_length() {
+                tracing::warn!(
+                    "{} chunks in {} hit the {max_length}-token limit and were truncated",
+                    chunks_truncated,
+                    item.path
+                );
+            } else {
+                tracing::warn!(
+                    "{} chunks in {} hit the embedder token limit and were truncated",
+                    chunks_truncated,
+                    item.path
+                );
+            }
+            truncated_total += chunks_truncated;
+        }
         let ids = doc_ids_for_chunks(source_id, &item.path, schema_id, &chunks);
         prepared.push(PreparedFile {
             path: &item.path,
@@ -212,6 +231,7 @@ pub(super) async fn index_batch(
     }
 
     result.chunks_deleted += chunks_deleted;
+    result.chunks_truncated += truncated_total;
     result.files_processed += items.len();
     result
         .files_processed_paths
