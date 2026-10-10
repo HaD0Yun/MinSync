@@ -144,6 +144,7 @@ async fn sync(
                 println!("  embedding API calls: {}", result.embedding_api_calls);
                 println!("  embedded texts:      {}", result.embedded_texts);
                 println!("  embeddings reused:   {}", result.embeddings_reused);
+                println!("  chunks truncated:    {}", result.chunks_truncated);
                 println!("  estimated tokens:    {}", result.estimated_tokens);
             }
         }
@@ -329,6 +330,17 @@ async fn verify(
                 );
             } else {
                 println!("VERIFICATION FAILED");
+                if !result.embedding_integrity.flagged_pairs.is_empty() {
+                    println!("Embedding integrity flagged pairs:");
+                    for pair in &result.embedding_integrity.flagged_pairs {
+                        println!(
+                            "  chunks {} ({})",
+                            pair.chunk_ids.join(", "),
+                            pair.paths.join(", ")
+                        );
+                    }
+                    println!("Recommendation: run minsync sync --full");
+                }
             }
         }
         OutputFormat::Json => {

@@ -209,6 +209,10 @@ impl LanceDbInner {
         Ok(found)
     }
 
+    pub(super) async fn documents(&self) -> Result<Vec<Document>> {
+        self.scan_documents(None).await
+    }
+
     /// Existence check that projects only `id`: no vectors or text are read.
     pub(super) async fn existing_ids(&self, ids: Vec<String>) -> Result<HashSet<String>> {
         if ids.is_empty() {

@@ -71,6 +71,9 @@ pub trait VectorStore: Send + Sync {
     ) -> Result<std::collections::HashMap<String, Vec<f32>>> {
         Ok(std::collections::HashMap::new())
     }
+    fn documents(&self) -> Result<Vec<Document>> {
+        Ok(Vec::new())
+    }
     /// Which of `ids` are present. Stores should avoid materializing full
     /// rows (vectors, text) for what is only an existence check.
     fn existing_ids(&self, ids: &[String]) -> Result<std::collections::HashSet<String>> {

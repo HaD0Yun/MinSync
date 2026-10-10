@@ -17,6 +17,7 @@ pub(super) enum Command {
     Update(Vec<DocumentUpdate>, Resp<()>),
     Fetch(Vec<String>, Resp<Vec<Document>>),
     FetchEmbeddingsByContentHash(Vec<String>, Resp<HashMap<String, Vec<f32>>>),
+    Documents(Resp<Vec<Document>>),
     ExistingIds(Vec<String>, Resp<std::collections::HashSet<String>>),
     InsertNew(Vec<Document>, Resp<()>),
     Delete(Filter, Resp<usize>),
@@ -86,6 +87,7 @@ pub(super) fn run_worker(
                 resp,
                 rt.block_on(inner.fetch_embeddings_by_content_hash(hashes)),
             ),
+            Command::Documents(resp) => send_response(resp, rt.block_on(inner.documents())),
             Command::ExistingIds(ids, resp) => {
                 send_response(resp, rt.block_on(inner.existing_ids(ids)))
             }
